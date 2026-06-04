@@ -24,9 +24,7 @@
     "ui/vite.config.js",
     "ui/eslint.config.js",
     "public/",
-    "README.md",
-    "mod.ts",
-    "deno.json"
+    "README.md"
   ],
   "scripts": {
     "start": "node index.js",
