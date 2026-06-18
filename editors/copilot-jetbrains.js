@@ -110,29 +110,37 @@ function getMessages(chat) {
   const events = parseEvents(sessionDir);
   const result = [];
 
+  // Tool calls in the JetBrains format are separate `tool.execution_start` /
+  // `tool.execution_complete` events (NOT embedded in assistant.message like
+  // the CLI format). Buffer pending tool calls and attach them to the next
+  // assistant message iteration, per the spec's grouping algorithm.
+  const pendingToolCalls = [];
+
   for (const event of events) {
     if (event.type === 'user.message') {
-      const content = event.data?.content;
+      const content = extractContent(event.data?.content);
       if (content) result.push({ role: 'user', content });
+
+    } else if (event.type === 'tool.execution_start') {
+      const data = event.data || {};
+      const tcName = data.toolName || 'unknown';
+      const args = data.arguments || {};
+      const parsedArgs = typeof args === 'string' ? safeParse(args) : args;
+      pendingToolCalls.push({ name: tcName, args: parsedArgs });
 
     } else if (event.type === 'assistant.message') {
       const data = event.data || {};
       const parts = [];
-      const toolCalls = [];
+      const toolCalls = pendingToolCalls.length > 0 ? pendingToolCalls.splice(0) : [];
 
-      // Main text content
-      if (data.content) parts.push(data.content);
+      // Main text content — handle legacy double-encoded JSON array shape.
+      const text = extractContent(data.content != null ? data.content : data.text);
+      if (text) parts.push(text);
 
-      // Tool requests
-      if (data.toolRequests && Array.isArray(data.toolRequests)) {
-        for (const tr of data.toolRequests) {
-          const tcName = tr.name || tr.toolName || 'unknown';
-          const args = tr.args || tr.arguments || tr.input || {};
-          const parsedArgs = typeof args === 'string' ? safeParse(args) : args;
-          const argKeys = typeof parsedArgs === 'object' ? Object.keys(parsedArgs).join(', ') : '';
-          parts.push(`[tool-call: ${tcName}(${argKeys})]`);
-          toolCalls.push({ name: tcName, args: parsedArgs });
-        }
+      // Render buffered tool calls inline for compactness.
+      for (const tc of toolCalls) {
+        const argKeys = typeof tc.args === 'object' ? Object.keys(tc.args).join(', ') : '';
+        parts.push(`[tool-call: ${tc.name}(${argKeys})]`);
       }
 
       if (parts.length > 0) {
@@ -145,7 +153,49 @@ function getMessages(chat) {
     }
   }
 
+  // Flush any tool calls left dangling (turn ended without a final assistant.message).
+  if (pendingToolCalls.length > 0) {
+    const parts = pendingToolCalls.map(tc => {
+      const argKeys = typeof tc.args === 'object' ? Object.keys(tc.args).join(', ') : '';
+      return `[tool-call: ${tc.name}(${argKeys})]`;
+    });
+    result.push({
+      role: 'assistant',
+      content: parts.join('\n'),
+      _toolCalls: pendingToolCalls.splice(0),
+    });
+  }
+
   return result;
+}
+
+/**
+ * Extract assistant response text from a `data.content` value.
+ * Handles plain strings and the legacy double-encoded JSON array shape
+ * (older partitions store content as a stringified array of
+ * {role, content, tool_calls} objects — pick the last role:assistant
+ * entry with non-empty content).
+ */
+function extractContent(contentVal) {
+  if (contentVal == null) return '';
+  if (typeof contentVal === 'string') {
+    const trimmed = contentVal.trim();
+    if (trimmed.startsWith('[')) {
+      try {
+        const arr = JSON.parse(contentVal);
+        if (Array.isArray(arr)) {
+          for (let i = arr.length - 1; i >= 0; i--) {
+            const el = arr[i];
+            if (el && el.role === 'assistant' && el.content) {
+              return typeof el.content === 'string' ? el.content : extractContent(el.content);
+            }
+          }
+        }
+      } catch { /* fall through to raw string */ }
+    }
+    return contentVal;
+  }
+  return '';
 }
 
 function safeParse(str) {
